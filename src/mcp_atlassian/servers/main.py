@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
@@ -16,7 +17,7 @@ from fastmcp.tools import Tool as FastMCPTool
 from mcp.types import Tool as MCPTool
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mcp_atlassian.confluence import ConfluenceFetcher
@@ -28,6 +29,8 @@ from mcp_atlassian.utils.io import is_read_only_mode
 from mcp_atlassian.utils.logging import mask_sensitive
 from mcp_atlassian.utils.tools import get_enabled_tools, should_include_tool
 from mcp_atlassian.utils.urls import validate_url_for_ssrf
+
+from mcp_atlassian.oauth import OAuthManager
 
 from .confluence import confluence_mcp
 from .context import MainAppContext
@@ -101,42 +104,58 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict[str,
 
     loaded_jira_config: JiraConfig | None = None
     loaded_confluence_config: ConfluenceConfig | None = None
+    oauth_manager: OAuthManager | None = None
 
-    if services.get("jira"):
-        try:
-            jira_config = JiraConfig.from_env()
-            if jira_config.is_auth_configured():
-                loaded_jira_config = jira_config
-                logger.info(
-                    "Jira configuration loaded and authentication is configured."
-                )
-            else:
-                logger.warning(
-                    "Jira URL found, but authentication is not fully configured. Jira tools will be unavailable."
-                )
-        except Exception as e:
-            logger.error(f"Failed to load Jira configuration: {e}", exc_info=True)
+    per_user_oauth = os.getenv("ATLASSIAN_PER_USER_OAUTH", "false").lower() == "true"
 
-    if services.get("confluence"):
+    if per_user_oauth:
+        logger.info("Per-user OAuth mode enabled")
         try:
-            confluence_config = ConfluenceConfig.from_env()
-            if confluence_config.is_auth_configured():
-                loaded_confluence_config = confluence_config
-                logger.info(
-                    "Confluence configuration loaded and authentication is configured."
-                )
-            else:
-                logger.warning(
-                    "Confluence URL found, but authentication is not fully configured. Confluence tools will be unavailable."
-                )
+            oauth_manager = OAuthManager.from_env()
+            app._oauth_manager = oauth_manager  # type: ignore[union-attr]
         except Exception as e:
-            logger.error(f"Failed to load Confluence configuration: {e}", exc_info=True)
+            logger.error(f"Failed to initialise OAuthManager: {e}", exc_info=True)
+            raise
+        if services.get("jira") and oauth_manager.is_configured("jira"):
+            try:
+                loaded_jira_config = JiraConfig.from_env()
+                logger.info("Jira DC OAuth app config loaded (per-user mode)")
+            except Exception as e:
+                logger.error(f"Failed to load Jira config: {e}", exc_info=True)
+        if services.get("confluence") and oauth_manager.is_configured("confluence"):
+            try:
+                loaded_confluence_config = ConfluenceConfig.from_env()
+                logger.info("Confluence DC OAuth app config loaded (per-user mode)")
+            except Exception as e:
+                logger.error(f"Failed to load Confluence config: {e}", exc_info=True)
+    else:
+        if services.get("jira"):
+            try:
+                jira_config = JiraConfig.from_env()
+                if jira_config.is_auth_configured():
+                    loaded_jira_config = jira_config
+                    logger.info("Jira configuration loaded and authentication is configured.")
+                else:
+                    logger.warning("Jira URL found, but authentication is not fully configured.")
+            except Exception as e:
+                logger.error(f"Failed to load Jira configuration: {e}", exc_info=True)
+        if services.get("confluence"):
+            try:
+                confluence_config = ConfluenceConfig.from_env()
+                if confluence_config.is_auth_configured():
+                    loaded_confluence_config = confluence_config
+                    logger.info("Confluence configuration loaded and authentication is configured.")
+                else:
+                    logger.warning("Confluence URL found, but authentication is not fully configured.")
+            except Exception as e:
+                logger.error(f"Failed to load Confluence configuration: {e}", exc_info=True)
 
     app_context = MainAppContext(
         full_jira_config=loaded_jira_config,
         full_confluence_config=loaded_confluence_config,
         read_only=read_only,
         enabled_tools=enabled_tools,
+        oauth_manager=oauth_manager,
     )
     logger.info(f"Read-only mode: {'ENABLED' if read_only else 'DISABLED'}")
     logger.info(f"Enabled tools filter: {enabled_tools or 'All tools enabled'}")
@@ -164,6 +183,7 @@ class AtlassianMCP(FastMCP[MainAppContext]):
     """Custom FastMCP server class for Atlassian integration with tool filtering."""
 
     _active_streamable_http_path: str | None = None
+    _oauth_manager: OAuthManager | None = None
 
     @staticmethod
     def _normalize_http_path(path: str) -> str:
@@ -304,7 +324,11 @@ class AtlassianMCP(FastMCP[MainAppContext]):
             final_path = self._normalize_http_path(configured_path)
             self._active_streamable_http_path = final_path
 
-        user_token_mw = Middleware(UserTokenMiddleware, mcp_server_ref=self)
+        user_token_mw = Middleware(
+            UserTokenMiddleware,
+            mcp_server_ref=self,
+            oauth_manager=self._oauth_manager,
+        )
         final_middleware_list = [user_token_mw]
         if middleware:
             final_middleware_list.extend(middleware)
@@ -333,10 +357,14 @@ class UserTokenMiddleware:
     """
 
     def __init__(
-        self, app: ASGIApp, mcp_server_ref: Optional["AtlassianMCP"] = None
+        self,
+        app: ASGIApp,
+        mcp_server_ref: Optional["AtlassianMCP"] = None,
+        oauth_manager: Optional[OAuthManager] = None,
     ) -> None:
         self.app = app
         self.mcp_server_ref = mcp_server_ref
+        self._oauth_manager = oauth_manager
         if not self.mcp_server_ref:
             logger.warning(
                 "UserTokenMiddleware initialized without mcp_server_ref. "
@@ -407,7 +435,11 @@ class UserTokenMiddleware:
             status_code: HTTP status code (e.g., 401).
             error_message: Error message to include in JSON body.
         """
-        body = json.dumps({"error": error_message}).encode("utf-8")
+        try:
+            parsed = json.loads(error_message)
+            body = json.dumps(parsed).encode("utf-8")
+        except (json.JSONDecodeError, TypeError):
+            body = json.dumps({"error": error_message}).encode("utf-8")
         await send(
             {
                 "type": "http.response.start",
@@ -436,6 +468,38 @@ class UserTokenMiddleware:
     def _process_authentication_headers(self, scope: Scope) -> None:
         """Process authentication headers and store in scope state."""
         try:
+            # --- Per-user OAuth token injection ---
+            if self._oauth_manager is not None:
+                raw_headers: list[tuple[bytes, bytes]] = list(scope.get("headers", []))
+                x_username_bytes = next(
+                    (v for k, v in raw_headers if k == b"x-username"), None
+                )
+                if x_username_bytes:
+                    username = x_username_bytes.decode("latin-1").strip()
+                    token: str | None = None
+                    for svc in ("jira", "confluence"):
+                        if self._oauth_manager.is_configured(svc):
+                            token = self._oauth_manager.get_valid_token(username, svc)
+                            if token:
+                                break
+                    if token:
+                        raw_headers = [(k, v) for k, v in raw_headers if k != b"authorization"]
+                        raw_headers.append(
+                            (b"authorization", f"Bearer {token}".encode("latin-1"))
+                        )
+                        scope["headers"] = raw_headers
+                        scope["state"]["injected_username"] = username
+                        logger.debug(f"UserTokenMiddleware: Injected OAuth token for {username}")
+                    else:
+                        auth_url = f"/oauth/jira/start?username={username}"
+                        scope["state"]["auth_validation_error"] = json.dumps({
+                            "error": "oauth_required",
+                            "message": f"Authorization required for user '{username}'. Visit auth_url to authorize.",
+                            "auth_url": auth_url,
+                        })
+                        return
+            # --- End per-user OAuth injection ---
+
             # Parse headers from scope (headers are byte tuples per ASGI spec)
             headers = dict(scope.get("headers", []))
             auth_header = headers.get(b"authorization")
@@ -643,4 +707,55 @@ async def _health_check_route(request: Request) -> JSONResponse:
     return await health_check(request)
 
 
-logger.info("Added /healthz endpoint for Kubernetes probes")
+@main_mcp.custom_route("/oauth/{service}/start", methods=["GET"], include_in_schema=False)
+async def _oauth_start(request: Request) -> RedirectResponse | JSONResponse:
+    """Redirect the user to the Jira / Confluence consent page."""
+    service = request.path_params.get("service", "")
+    username = request.query_params.get("username", "").strip()
+    mgr: OAuthManager | None = main_mcp._oauth_manager
+    if mgr is None:
+        return JSONResponse({"error": "OAuth not enabled"}, status_code=501)
+    if not username:
+        return JSONResponse({"error": "username query param required"}, status_code=400)
+    if not mgr.is_configured(service):
+        return JSONResponse({"error": f"OAuth not configured for service: {service}"}, status_code=400)
+    auth_url = mgr.start_authorization(username, service)
+    return RedirectResponse(url=auth_url, status_code=302)
+
+
+@main_mcp.custom_route("/oauth/callback", methods=["GET"], include_in_schema=False)
+async def _oauth_callback(request: Request) -> HTMLResponse:
+    """Handle the OAuth 2.0 authorization code callback from Jira / Confluence."""
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    mgr: OAuthManager | None = main_mcp._oauth_manager
+    if mgr is None:
+        return HTMLResponse("<h2>OAuth not enabled on this server.</h2>", status_code=501)
+    ok = mgr.handle_callback(code, state)
+    if ok:
+        return HTMLResponse(
+            "<h2>Authorization successful!</h2><p>You can close this tab and retry your request.</p>",
+            status_code=200,
+        )
+    return HTMLResponse(
+        "<h2>Authorization failed.</h2><p>The link may have expired. Please try again.</p>",
+        status_code=400,
+    )
+
+
+@main_mcp.custom_route("/oauth/status/{username}", methods=["GET"], include_in_schema=False)
+async def _oauth_status(request: Request) -> JSONResponse:
+    """Return the OAuth authorization status for a given username."""
+    username = request.path_params.get("username", "").strip()
+    mgr: OAuthManager | None = main_mcp._oauth_manager
+    if mgr is None:
+        return JSONResponse({"error": "OAuth not enabled"}, status_code=501)
+    statuses = {}
+    for svc in ("jira", "confluence"):
+        if mgr.is_configured(svc):
+            token = mgr.get_valid_token(username, svc)
+            statuses[svc] = "authorized" if token else "not_authorized"
+    return JSONResponse({"username": username, "services": statuses})
+
+
+logger.info("Added /healthz and /oauth/* endpoints")

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from mcp_atlassian.confluence.config import ConfluenceConfig
     from mcp_atlassian.jira.config import JiraConfig
+    from mcp_atlassian.oauth.manager import OAuthManager
 
 
 @dataclass(frozen=True)
@@ -20,3 +21,4 @@ class MainAppContext:
     full_confluence_config: ConfluenceConfig | None = None
     read_only: bool = False
     enabled_tools: list[str] | None = None
+    oauth_manager: OAuthManager | None = None
