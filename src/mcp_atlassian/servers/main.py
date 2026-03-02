@@ -37,6 +37,7 @@ from .context import MainAppContext
 from .jira import jira_mcp
 
 logger = logging.getLogger("mcp-atlassian.server.main")
+logging.getLogger("docket").setLevel(logging.WARNING)
 
 
 def _sanitize_schema_for_compatibility(tool: MCPTool) -> MCPTool:
