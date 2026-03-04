@@ -470,7 +470,15 @@ class UserTokenMiddleware:
         """Process authentication headers and store in scope state."""
         try:
             # --- Per-user OAuth token injection ---
-            if self._oauth_manager is not None:
+            # Resolve oauth_manager at request time: the middleware is created before the
+            # lifespan sets app._oauth_manager, so self._oauth_manager is always None at
+            # construction. Fall back to mcp_server_ref._oauth_manager which is set by the
+            # lifespan and therefore available by the time requests arrive.
+            _oauth_manager = self._oauth_manager or (
+                getattr(self.mcp_server_ref, "_oauth_manager", None)
+                if self.mcp_server_ref else None
+            )
+            if _oauth_manager is not None:
                 raw_headers: list[tuple[bytes, bytes]] = list(scope.get("headers", []))
                 x_username_bytes = next(
                     (v for k, v in raw_headers if k == b"x-username"), None
@@ -479,8 +487,8 @@ class UserTokenMiddleware:
                     username = x_username_bytes.decode("latin-1").strip()
                     token: str | None = None
                     for svc in ("jira", "confluence"):
-                        if self._oauth_manager.is_configured(svc):
-                            token = self._oauth_manager.get_valid_token(username, svc)
+                        if _oauth_manager.is_configured(svc):
+                            token = _oauth_manager.get_valid_token(username, svc)
                             if token:
                                 break
                     if token:
