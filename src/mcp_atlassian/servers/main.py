@@ -422,6 +422,17 @@ class UserTokenMiddleware:
         auth_error = scope_copy["state"].get("auth_validation_error")
         if auth_error:
             logger.warning(f"Authentication failed: {auth_error}")
+            # For oauth_required, return a proper MCP JSON-RPC error so Claude/Cursor
+            # can surface the auth URL to the user instead of showing a cryptic 401.
+            try:
+                error_data = json.loads(auth_error)
+                if error_data.get("error") == "oauth_required":
+                    await self._send_mcp_oauth_required_response(
+                        safe_send, receive, error_data
+                    )
+                    return
+            except (json.JSONDecodeError, AttributeError):
+                pass
             await self._send_json_error_response(safe_send, 401, auth_error)
             return  # Don't call self.app - request is rejected
 
@@ -454,6 +465,69 @@ class UserTokenMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+    async def _send_mcp_oauth_required_response(
+        self, send: Send, receive: Receive, error_data: dict
+    ) -> None:
+        """Return a 200 MCP JSON-RPC error so the AI can relay the auth URL to the user.
+
+        A plain HTTP 401 breaks the MCP protocol. By returning a valid JSON-RPC error
+        response (HTTP 200, SSE body), Claude/Cursor can display the authorization URL
+        directly in the chat instead of showing a cryptic transport error.
+        """
+        # Read the request body to extract the JSON-RPC id.
+        request_id = None
+        try:
+            chunks: list[bytes] = []
+            while True:
+                msg = await receive()
+                if msg["type"] == "http.request":
+                    chunks.append(msg.get("body", b""))
+                    if not msg.get("more_body", False):
+                        break
+            body_bytes = b"".join(chunks)
+            if body_bytes:
+                payload = json.loads(body_bytes)
+                request_id = payload.get("id")
+        except Exception as e:
+            logger.debug(f"Could not extract JSON-RPC id from request body: {e}")
+
+        # Build an absolute auth URL.
+        auth_path = error_data.get("auth_url", "/oauth/jira/start")
+        if auth_path.startswith("/"):
+            # Derive base URL from JIRA_OAUTH_CALLBACK_URL env var.
+            callback_url = os.getenv("JIRA_OAUTH_CALLBACK_URL", "")
+            if callback_url:
+                # Strip /oauth/callback suffix to get the server base URL.
+                base = callback_url.split("/oauth/")[0]
+            else:
+                base = ""
+            auth_url = f"{base}{auth_path}" if base else auth_path
+        else:
+            auth_url = auth_path
+
+        message = (
+            f"Jira authorization required for this user. "
+            f"Please visit the following URL to grant access, then retry: {auth_url}"
+        )
+
+        rpc_error = json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32001, "message": message},
+        })
+        sse_body = f"event: message\r\ndata: {rpc_error}\r\n\r\n".encode("utf-8")
+
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", b"text/event-stream"),
+                (b"cache-control", b"no-cache"),
+                (b"connection", b"keep-alive"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": sse_body, "more_body": False})
 
     def _should_process_auth(self, scope: Scope) -> bool:
         """Check if this request should be processed for authentication."""
