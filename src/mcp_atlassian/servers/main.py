@@ -574,6 +574,12 @@ class UserTokenMiddleware:
                     username = x_username_bytes.decode("latin-1").strip() or None
                 if not username:
                     auth_bytes = next((v for k, v in raw_headers if k == b"authorization"), None)
+                    if not auth_bytes:
+                        # nginx may forward the client token as X-Authorization instead of
+                        # Authorization (e.g. when the upstream strips/renames the header).
+                        auth_bytes = next((v for k, v in raw_headers if k == b"x-authorization"), None)
+                        if auth_bytes:
+                            logger.debug("UserTokenMiddleware: Using x-authorization header for JWT sub extraction")
                     if auth_bytes:
                         auth_str = auth_bytes.decode("latin-1")
                         if auth_str.startswith("Bearer "):
