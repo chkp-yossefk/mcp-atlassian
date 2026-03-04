@@ -4,6 +4,8 @@ import base64
 import json
 import logging
 import os
+
+import jwt as _pyjwt
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
@@ -489,8 +491,32 @@ class UserTokenMiddleware:
                     f"x-username={x_username_bytes!r}, "
                     f"header_keys={header_keys}"
                 )
+
+                # Resolve username: prefer X-Username header (set by nginx after auth_request).
+                # Fall back to decoding the Bearer JWT's sub claim — the request is already
+                # authenticated by nginx auth_request so signature verification is not needed.
+                username: str | None = None
                 if x_username_bytes:
-                    username = x_username_bytes.decode("latin-1").strip()
+                    username = x_username_bytes.decode("latin-1").strip() or None
+                if not username:
+                    auth_bytes = next((v for k, v in raw_headers if k == b"authorization"), None)
+                    if auth_bytes:
+                        auth_str = auth_bytes.decode("latin-1")
+                        if auth_str.startswith("Bearer "):
+                            bearer = auth_str[7:].strip()
+                            try:
+                                claims = _pyjwt.decode(
+                                    bearer, options={"verify_signature": False}
+                                )
+                                username = claims.get("sub") or claims.get("preferred_username") or None
+                                if username:
+                                    logger.debug(
+                                        f"UserTokenMiddleware: Extracted username from JWT sub: {username}"
+                                    )
+                            except Exception as jwt_err:
+                                logger.debug(f"UserTokenMiddleware: Could not decode Bearer JWT: {jwt_err}")
+
+                if username:
                     token: str | None = None
                     for svc in ("jira", "confluence"):
                         if _oauth_manager.is_configured(svc):
