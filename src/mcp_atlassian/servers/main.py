@@ -480,8 +480,14 @@ class UserTokenMiddleware:
             )
             if _oauth_manager is not None:
                 raw_headers: list[tuple[bytes, bytes]] = list(scope.get("headers", []))
+                header_keys = [k.decode("latin-1", errors="replace") for k, v in raw_headers]
                 x_username_bytes = next(
                     (v for k, v in raw_headers if k == b"x-username"), None
+                )
+                logger.debug(
+                    f"UserTokenMiddleware: oauth_manager present, "
+                    f"x-username={x_username_bytes!r}, "
+                    f"header_keys={header_keys}"
                 )
                 if x_username_bytes:
                     username = x_username_bytes.decode("latin-1").strip()
